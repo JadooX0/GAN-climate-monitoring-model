@@ -12,46 +12,48 @@ import matplotlib.pyplot as plt
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.backends.cudnn.benchmark = True  # Maximizes parallel execution on GPU
+torch.backends.cudnn.benchmark = True  
 
-NUM_EPOCHS = 800       
-BATCH_SIZE = 32          
+NUM_EPOCHS = 800        
+BATCH_SIZE = 32        
 LR = 0.0002
 BETA1 = 0.5
 BETA2 = 0.999
-LAMBDA_L1 = 100.0       
-
+LAMBDA_L1 = 100.0        
 
 class CopernicusMultiFileDataset(Dataset):
     """
     Automating multi-file handling for time-split Copernicus datasets.
-    Combines independent .nc file chunks seamlessly.
+    Handles 1D time-series vectors and protects against unexpected NaN values.
     """
     def __init__(self, file_pattern):
         super(CopernicusMultiFileDataset, self).__init__()
         
-        # Find all files matching pattern
         self.file_paths = sorted(glob.glob(file_pattern))
         if len(self.file_paths) == 0:
             raise FileNotFoundError(f"No NetCDF files found matching pattern: {file_pattern}")
             
         print(f"Successfully found and merging {len(self.file_paths)} files into memory...")
         
-        
         with xr.open_mfdataset(self.file_paths, combine='by_coords', chunks={'time': 100}) as ds:
-           
+          
             self.temp = ds['t2m'].values          
             self.dew_point = ds['d2m'].values     
             self.ssrd_target = ds['ssrd'].values   
         
-        
+       
         self.temp = self._scale_data(self.temp)
         self.dew_point = self._scale_data(self.dew_point)
         self.ssrd_target = self._scale_data(self.ssrd_target)
 
     def _scale_data(self, matrix):
+       
+        if np.isnan(matrix).all():
+            return np.zeros_like(matrix)
+            
         min_v, max_v = np.nanmin(matrix), np.nanmax(matrix)
-        matrix = np.nan_to_num(matrix, nan=min_v)
+        matrix = np.nan_to_num(matrix, nan=min_v if not np.isnan(min_v) else 0.0)
+        
         if max_v - min_v == 0:
             return matrix - min_v
         return ((matrix - min_v) / (max_v - min_v)) * 2.0 - 1.0
@@ -60,14 +62,30 @@ class CopernicusMultiFileDataset(Dataset):
         return self.ssrd_target.shape[0]
 
     def __getitem__(self, idx):
-        
-        input_tensor = np.stack([self.temp[idx], self.dew_point[idx]], axis=0).astype(np.float32)
-        
-        target_tensor = np.expand_dims(self.ssrd_target[idx], axis=0).astype(np.float32)
-        
+        t_val = self.temp[idx]
+        d_val = self.dew_point[idx]
+        s_val = self.ssrd_target[idx]
+
        
-        input_tensor = self._match_dimensions(input_tensor, 256, 256)
-        target_tensor = self._match_dimensions(target_tensor, 256, 256)
+        if np.isscalar(t_val) or t_val.ndim == 0:
+           
+            input_tensor = np.zeros((2, 256, 256), dtype=np.float32)
+            input_tensor[0, :, :] = t_val
+            input_tensor[1, :, :] = d_val
+            
+            target_tensor = np.zeros((1, 256, 256), dtype=np.float32)
+            target_tensor[0, :, :] = s_val
+        else:
+            if t_val.ndim == 1:
+                t_val = np.atleast_2d(t_val)
+                d_val = np.atleast_2d(d_val)
+                s_val = np.atleast_2d(s_val)
+
+            input_tensor = np.stack([t_val, d_val], axis=0).astype(np.float32)
+            target_tensor = np.expand_dims(s_val, axis=0).astype(np.float32)
+            
+            input_tensor = self._match_dimensions(input_tensor, 256, 256)
+            target_tensor = self._match_dimensions(target_tensor, 256, 256)
         
         return torch.tensor(input_tensor), torch.tensor(target_tensor)
 
@@ -81,10 +99,11 @@ class CopernicusMultiFileDataset(Dataset):
         return tmp
 
 
+
 class DroGenerator(nn.Module):
     def __init__(self):
         super(DroGenerator, self).__init__()
-        # 2 Input Channels -> [t2m, d2m]
+
         self.enc1 = nn.Conv2d(2, 64, kernel_size=4, stride=2, padding=1) 
         self.enc2 = nn.Sequential(
             nn.LeakyReLU(0.2, inplace=True),
@@ -108,7 +127,7 @@ class DroGenerator(nn.Module):
 class DroDiscriminator(nn.Module):
     def __init__(self):
         super(DroDiscriminator, self).__init__()
-        # Input shape matches condition maps (2 channels) + SSI evaluation target (1 channel) = 3 total channels
+
         self.model = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
@@ -122,7 +141,7 @@ class DroDiscriminator(nn.Module):
     def forward(self, climate_vars, ssi_map):
         return self.model(torch.cat([climate_vars, ssi_map], dim=1))
 
-
+# Initialize modules on target hardware device
 netG = DroGenerator().to(device)
 netD = DroDiscriminator().to(device)
 
@@ -142,21 +161,21 @@ def run_pipeline():
         dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     except Exception as e:
         print(f"\n[Initialization Error]: {e}")
-        print(" -> Fix: Move your two downloaded '.nc' files into this exact folder hierarchy context.\n")
+        print(" -> Fix: Ensure your two downloaded '.nc' files match the script directory path context.\n")
         return
 
-    print(f"Starting training on device: {device}...")
+    print(f"Starting training framework pipeline on execution device: {device}")
     for epoch in range(1, NUM_EPOCHS + 1):
         for i, (climate_vars, real_ssi) in enumerate(dataloader):
             climate_vars = climate_vars.to(device)
             real_ssi = real_ssi.to(device)
             
-            
+       
             patch_dimensions = netD(climate_vars, real_ssi).size()
             real_label = torch.ones(patch_dimensions, device=device)
             fake_label = torch.zeros(patch_dimensions, device=device)
             
-            
+           
             optimizerD.zero_grad()
             loss_D_real = criterion_GAN(netD(climate_vars, real_ssi), real_label)
             
@@ -167,7 +186,7 @@ def run_pipeline():
             loss_D.backward()
             optimizerD.step()
             
-            
+           
             optimizerG.zero_grad()
             loss_G_GAN = criterion_GAN(netD(climate_vars, fake_ssi), real_label)
             loss_G_L1 = criterion_L1(fake_ssi, real_ssi)
@@ -179,8 +198,8 @@ def run_pipeline():
         if epoch % 50 == 0 or epoch == 1:
             print(f"Epoch [{epoch}/{NUM_EPOCHS}] | Discriminator Loss: {loss_D.item():.4f} | Generator Loss: {loss_G.item():.4f}")
 
-    
-    print("Running distribution verification passes...")
+   
+    print("Initiating distribution verification checks...")
     netG.eval()
     val_loader = DataLoader(dataset, batch_size=40, shuffle=False)
     val_climate, val_real_ssi = next(iter(val_loader))
